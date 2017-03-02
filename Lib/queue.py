@@ -8,7 +8,7 @@ from collections import deque
 from heapq import heappush, heappop
 from time import monotonic as time
 
-__all__ = ['Empty', 'Full', 'Queue', 'PriorityQueue', 'LifoQueue']
+__all__ = ['Empty', 'Full', 'Closed', 'Queue', 'PriorityQueue', 'LifoQueue']
 
 class Empty(Exception):
     'Exception raised by Queue.get(block=0)/get_nowait().'
@@ -16,6 +16,10 @@ class Empty(Exception):
 
 class Full(Exception):
     'Exception raised by Queue.put(block=0)/put_nowait().'
+    pass
+
+class Closed(Exception):
+    'Exception raised by Queue.get()/Queue.get_nowait()/Queue.put()/Queue.put_nowait()'
     pass
 
 class Queue:
@@ -46,6 +50,9 @@ class Queue:
         # drops to zero; thread waiting to join() is notified to resume
         self.all_tasks_done = threading.Condition(self.mutex)
         self.unfinished_tasks = 0
+
+        # Set to True in close()
+        self._closing = False
 
     def task_done(self):
         '''Indicate that a formerly enqueued task is complete.
@@ -112,6 +119,9 @@ class Queue:
         with self.mutex:
             return 0 < self.maxsize <= self._qsize()
 
+    def closed(self):
+        return self._closing
+
     def put(self, item, block=True, timeout=None):
         '''Put an item into the queue.
 
@@ -121,21 +131,32 @@ class Queue:
         the Full exception if no free slot was available within that time.
         Otherwise ('block' is false), put an item on the queue if a free slot
         is immediately available, else raise the Full exception ('timeout'
-        is ignored in that case).
+        is ignored in that case). If the queue has been closed, raise the
+        Closed exception.
         '''
         with self.not_full:
+            if self._closing:
+                raise Closed
             if self.maxsize > 0:
                 if not block:
                     if self._qsize() >= self.maxsize:
                         raise Full
                 elif timeout is None:
-                    while self._qsize() >= self.maxsize:
+                    while True:
+                        if self._closing:
+                            raise Closed
+                        elif self._qsize() < self.maxsize:
+                            break
                         self.not_full.wait()
                 elif timeout < 0:
                     raise ValueError("'timeout' must be a non-negative number")
                 else:
                     endtime = time() + timeout
-                    while self._qsize() >= self.maxsize:
+                    while True:
+                        if self._closing:
+                            raise Closed
+                        elif self._qsize() < self.maxsize:
+                            break
                         remaining = endtime - time()
                         if remaining <= 0.0:
                             raise Full
@@ -153,26 +174,39 @@ class Queue:
         the Empty exception if no item was available within that time.
         Otherwise ('block' is false), return an item if one is immediately
         available, else raise the Empty exception ('timeout' is ignored
-        in that case).
+        in that case). If the queue has been closed and is empty, raise the
+        Closed exception.
         '''
         with self.not_empty:
-            if not block:
+            if self._closing:
+                if not self._qsize():
+                    raise Closed
+                return self._get()
+            elif not block:
                 if not self._qsize():
                     raise Empty
             elif timeout is None:
-                while not self._qsize():
-                    self.not_empty.wait()
+                while True:
+                    if self._qsize():
+                        break
+                    elif self._closing:
+                        raise Closed
             elif timeout < 0:
                 raise ValueError("'timeout' must be a non-negative number")
             else:
                 endtime = time() + timeout
-                while not self._qsize():
+                while True:
+                    if self._qsize():
+                        break
+                    elif self._closing:
+                        raise Closed
                     remaining = endtime - time()
                     if remaining <= 0.0:
                         raise Empty
                     self.not_empty.wait(remaining)
             item = self._get()
-            self.not_full.notify()
+            if not self._closing:
+                self.not_full.notify()
             return item
 
     def put_nowait(self, item):
@@ -190,6 +224,16 @@ class Queue:
         raise the Empty exception.
         '''
         return self.get(block=False)
+
+    def close(self, clear=False):
+        '''Closes the queue. Calls to Queue.put will raise the Closed exception after this, and Queue.get after the
+        queue is empty. If arg 'clear' is true, the queue is emptied of items before the method returns.'''
+        self._closing = True
+        if clear:
+            with self.not_empty:
+                self._clear()
+        self.not_empty.notify_all()
+        self.not_full.notify_all()
 
     # Override these methods to implement other queue organizations
     # (e.g. stack or priority queue).
@@ -210,6 +254,10 @@ class Queue:
     def _get(self):
         return self.queue.popleft()
 
+    # Delete all items in the queue
+    def _clear(self):
+        self.queue.clear()
+
 
 class PriorityQueue(Queue):
     '''Variant of Queue that retrieves open entries in priority order (lowest first).
@@ -229,6 +277,9 @@ class PriorityQueue(Queue):
     def _get(self):
         return heappop(self.queue)
 
+    def _clear(self):
+        self.queue.clear()
+
 
 class LifoQueue(Queue):
     '''Variant of Queue that retrieves most recently added entries first.'''
@@ -244,3 +295,6 @@ class LifoQueue(Queue):
 
     def _get(self):
         return self.queue.pop()
+
+    def _clear(self):
+        self.queue.clear()
